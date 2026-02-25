@@ -254,7 +254,7 @@ async def handle_all_messages(message: Message):
         logging.error(f"Ошибка: {e}")
         await message.answer("❌ Произошла ошибка. Попробуйте позже.")
 
-# === ЗАПУСК С НОЧНЫМ ТАЙМЕРОМ ===
+# === ЗАПУСК С НОЧНЫМ ТАЙМЕРОМ (ИСПРАВЛЕННАЯ ВЕРСИЯ) ===
 async def main():
     print(f"✅ Бот запущен! ID группы: {GROUP_ID}")
     print(f"✅ Ссылка на группу: https://t.me/furry_lover_predl")
@@ -283,10 +283,11 @@ async def main():
             
             sleep_seconds = (wake_time_utc - now_utc).total_seconds()
             
+            # Если время пробуждения уже прошло (например, сейчас 7:31), значит спим до завтра
             if sleep_seconds < 0:
-                # Если уже после 7:30, но условие ночи сработало (значит время около 7:30)
-                print("🌞 Уже почти утро, запускаю бота...")
-                sleep_seconds = 0
+                wake_time_utc += datetime.timedelta(days=1)
+                sleep_seconds = (wake_time_utc - now_utc).total_seconds()
+                print(f"📅 Текущее время после 07:30, спим до завтрашнего утра")
                 
             print(f"😴 Сон на {sleep_seconds/3600:.2f} часов (до 07:30 МСК)")
             print("=" * 50)
@@ -297,12 +298,21 @@ async def main():
             print("🌞 Проснулись! Запускаю бота...")
             print("=" * 50)
         
-        # Запускаем бота
+        # Запускаем бота и ЖДЁМ, пока он не упадёт
         print("🤖 Бот работает...")
         print("=" * 50)
         try:
+            # Запускаем polling и ждём, пока он не завершится
             await dp.start_polling(bot)
         except Exception as e:
-            print(f"❌ Ошибка при работе: {e}")
+            print(f"❌ Бот упал с ошибкой: {e}")
             print("🔄 Перезапуск через 5 секунд...")
             await asyncio.sleep(5)
+        
+        # Небольшая пауза перед проверкой времени и перезапуском
+        print("⏳ Проверка времени перед следующим запуском...")
+        await asyncio.sleep(1)
+
+# === ЗАПУСК ===
+if __name__ == "__main__":
+    asyncio.run(main())
