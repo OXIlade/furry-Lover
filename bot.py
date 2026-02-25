@@ -4,6 +4,7 @@ import logging
 import sqlite3
 import datetime
 import threading
+import traceback
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from contextlib import contextmanager
 from aiogram import Bot, Dispatcher, types
@@ -43,7 +44,6 @@ def run_web_server():
         print(f"⚠️ Ошибка веб-сервера: {e}")
 
 # Запускаем веб-сервер в отдельном потоке
-# daemon=True значит, что поток закроется сам при выходе из программы
 web_thread = threading.Thread(target=run_web_server, daemon=True)
 web_thread.start()
 print("✅ Веб-сервер запущен в фоновом режиме")
@@ -200,95 +200,114 @@ async def unban_command(message: Message):
 # === ГЛАВНЫЙ ОБРАБОТЧИК ===
 @dp.message()
 async def handle_all_messages(message: Message):
-    # Сообщения из группы
-    if message.chat.id == GROUP_ID:
-        if message.reply_to_message and message.reply_to_message.forward_from:
-            user_id = message.reply_to_message.forward_from.id
-            
-            if is_banned(user_id):
-                await message.reply("❌ Пользователь заблокирован")
-                return
-            
-            try:
-                await bot.send_message(
-                    user_id, 
-                    f"📨 ответ от Furry Lover\n\n{message.text}"
-                )
-                await message.reply("✅ Ответ отправлен пользователю")
-            except:
-                await message.reply("❌ Ошибка при отправке")
-        return
-    
-    # Сообщения от пользователей
-    user = message.from_user
-    user_id = user.id
-    
-    if is_banned(user_id):
-        await message.answer("❌ Вы заблокированы")
-        return
-    
-    # Тип сообщения
-    if message.photo:
-        msg_type = "photo"
-    elif message.sticker:
-        msg_type = "sticker"
-    elif message.animation:
-        msg_type = "animation"
-    elif message.text:
-        msg_type = "text"
-    else:
-        msg_type = "other"
-    
-    # Антиспам
-    if msg_type != "photo":
-        if is_spam(user_id, msg_type):
-            await message.answer("⚠️ Слишком много сообщений. Подождите немного.")
-            return
-    
     try:
-        topic_id = get_user_topic(user_id)
+        # Сообщения из группы
+        if message.chat.id == GROUP_ID:
+            if message.reply_to_message and message.reply_to_message.forward_from:
+                user_id = message.reply_to_message.forward_from.id
+                
+                if is_banned(user_id):
+                    await message.reply("❌ Пользователь заблокирован")
+                    return
+                
+                try:
+                    await bot.send_message(
+                        user_id, 
+                        f"📨 ответ от Furry Lover\n\n{message.text}"
+                    )
+                    await message.reply("✅ Ответ отправлен пользователю")
+                except Exception as e:
+                    logging.error(f"Ошибка отправки ответа: {e}")
+                    await message.reply("❌ Ошибка при отправке")
+            return
         
-        if not topic_id:
-            topic_name = f"{user.full_name}"
-            if user.username:
-                topic_name += f" (@{user.username})"
-            topic_name = topic_name[:40]
-            
-            topic = await bot.create_forum_topic(
-                chat_id=GROUP_ID,
-                name=topic_name
-            )
-            topic_id = topic.message_thread_id
-            save_user_topic(user_id, topic_id)
-            
-            await bot.send_message(
-                chat_id=GROUP_ID,
-                message_thread_id=topic_id,
-                text=f"👤 **Новый пользователь:** {user.full_name}\n"
-                     f"🆔 **ID:** `{user_id}`\n"
-                     f"📝 **Username:** @{user.username if user.username else 'нет'}",
-                parse_mode="Markdown"
-            )
+        # Сообщения от пользователей
+        user = message.from_user
+        user_id = user.id
         
-        await bot.forward_message(
-            chat_id=GROUP_ID,
-            from_chat_id=user_id,
-            message_id=message.message_id,
-            message_thread_id=topic_id
-        )
+        logging.info(f"📨 Сообщение от пользователя {user_id} (@{user.username})")
         
-        if msg_type == "photo":
-            await message.answer("✅ Арт отправлен администратору на рассмотрение!")
-        elif msg_type == "sticker":
-            await message.answer("✅ Стикер отправлен администратору!")
-        elif msg_type == "animation":
-            await message.answer("✅ GIF отправлен администратору!")
+        if is_banned(user_id):
+            await message.answer("❌ Вы заблокированы")
+            return
+        
+        # Тип сообщения
+        if message.photo:
+            msg_type = "photo"
+        elif message.sticker:
+            msg_type = "sticker"
+        elif message.animation:
+            msg_type = "animation"
+        elif message.text:
+            msg_type = "text"
         else:
-            await message.answer("✅ Сообщение полетело админу^-^")
+            msg_type = "other"
+        
+        logging.info(f"📨 Тип сообщения: {msg_type}")
+        
+        # Антиспам
+        if msg_type != "photo":
+            if is_spam(user_id, msg_type):
+                logging.warning(f"⚠️ Спам от {user_id}")
+                await message.answer("⚠️ Слишком много сообщений. Подождите немного.")
+                return
+        
+        try:
+            topic_id = get_user_topic(user_id)
+            logging.info(f"📌 Тема пользователя: {topic_id}")
             
-    except Exception as e:
-        logging.error(f"Ошибка: {e}")
-        await message.answer("❌ Произошла ошибка. Попробуйте позже.")
+            if not topic_id:
+                logging.info(f"🆕 Создаем тему для {user_id}")
+                topic_name = f"{user.full_name}"
+                if user.username:
+                    topic_name += f" (@{user.username})"
+                topic_name = topic_name[:40]
+                
+                topic = await bot.create_forum_topic(
+                    chat_id=GROUP_ID,
+                    name=topic_name
+                )
+                topic_id = topic.message_thread_id
+                save_user_topic(user_id, topic_id)
+                logging.info(f"✅ Тема создана: {topic_id}")
+                
+                await bot.send_message(
+                    chat_id=GROUP_ID,
+                    message_thread_id=topic_id,
+                    text=f"👤 **Новый пользователь:** {user.full_name}\n"
+                         f"🆔 **ID:** `{user_id}`\n"
+                         f"📝 **Username:** @{user.username if user.username else 'нет'}",
+                    parse_mode="Markdown"
+                )
+            
+            await bot.forward_message(
+                chat_id=GROUP_ID,
+                from_chat_id=user_id,
+                message_id=message.message_id,
+                message_thread_id=topic_id
+            )
+            logging.info(f"✅ Сообщение переслано в тему {topic_id}")
+            
+            if msg_type == "photo":
+                await message.answer("✅ Арт отправлен администратору на рассмотрение!")
+            elif msg_type == "sticker":
+                await message.answer("✅ Стикер отправлен администратору!")
+            elif msg_type == "animation":
+                await message.answer("✅ GIF отправлен администратору!")
+            else:
+                await message.answer("✅ Сообщение полетело админу^-^")
+                
+        except Exception as e:
+            error_details = traceback.format_exc()
+            logging.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {e}")
+            logging.error(f"📋 Детали: {error_details}")
+            logging.error(f"👤 Пользователь: {user_id}")
+            logging.error(f"📨 Тип сообщения: {msg_type}")
+            await message.answer("❌ Произошла ошибка. Попробуйте позже.")
+            
+    except Exception as global_e:
+        logging.error(f"❌ ГЛОБАЛЬНАЯ ОШИБКА: {global_e}")
+        logging.error(traceback.format_exc())
 
 # === ЗАПУСК (БЕЗ НОЧНОГО РЕЖИМА) ===
 async def main():
@@ -302,6 +321,7 @@ async def main():
         await dp.start_polling(bot)
     except Exception as e:
         print(f"❌ Бот упал с ошибкой: {e}")
+        print(traceback.format_exc())
         print("🔄 Перезапуск через 5 секунд...")
         await asyncio.sleep(5)
         # Перезапускаем main
