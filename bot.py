@@ -272,13 +272,13 @@ async def handle_all_messages(message: Message):
                 logging.info(f"✅ Тема создана: {topic_id}")
                 
                 await bot.send_message(
-                    chat_id=GROUP_ID,
-                    message_thread_id=topic_id,
-                    text=f"👤 **Новый пользователь:** {user.full_name}\n"
-                         f"🆔 **ID:** `{user_id}`\n"
-                         f"📝 **Username:** @{user.username if user.username else 'нет'}",
-                    parse_mode="Markdown"
-                )
+    chat_id=GROUP_ID,
+    message_thread_id=topic_id,
+    text=f"👤 Новый пользователь: {user.full_name}\n"
+         f"🆔 ID: {user_id}\n"
+         f"📝 Username: @{user.username if user.username else 'нет'}"
+    # parse_mode УБРАЛИ!
+)
             
             await bot.forward_message(
                 chat_id=GROUP_ID,
