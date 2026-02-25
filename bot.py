@@ -258,47 +258,41 @@ async def handle_all_messages(message: Message):
 async def main():
     print(f"✅ Бот запущен! ID группы: {GROUP_ID}")
     print(f"✅ Ссылка на группу: https://t.me/furry_lover_predl")
-    print(f"🕐 Текущее время: {datetime.datetime.now().strftime('%H:%M')}")
-    print("=" * 50)
+    print(f"🌍 Часовой пояс: UTC+{TIMEZONE_OFFSET}")
     
-    while True:  # Бесконечный цикл для повторения каждый день
-        # Ночной режим (00:00 - 07:30)
-        now = datetime.datetime.now()
-        current_time = now.time()
+    while True:
+        # Текущее время с учётом часового пояса
+        now_utc = datetime.datetime.now()
+        now_local = now_utc + datetime.timedelta(hours=TIMEZONE_OFFSET)
+        current_time = now_local.time()
+        
+        print(f"🕐 Текущее время: {now_local.strftime('%H:%M')}")
+        
+        # Ночной режим (00:00 - 07:30 по местному времени)
         night_start = datetime.time(0, 0)
         night_end = datetime.time(7, 30)
         
-        # Проверяем, ночное ли сейчас время
         if night_start <= current_time <= night_end:
-            print("🌙 Сейчас ночное время (00:00-07:30). Бот уходит в спячку...")
+            print(f"🌙 Ночное время. Бот уходит в спячку до 07:30...")
             
-            # Вычисляем время пробуждения (сегодня в 07:30)
-            wake_time = now.replace(hour=7, minute=30, second=0, microsecond=0)
+            # Время пробуждения
+            wake_time_local = now_local.replace(hour=7, minute=30, second=0, microsecond=0)
+            wake_time_utc = wake_time_local - datetime.timedelta(hours=TIMEZONE_OFFSET)
             
-            # Если сейчас время после полуночи, но до 7:30 - просыпаемся сегодня
-            # wake_time уже правильное (сегодня в 7:30)
+            sleep_seconds = (wake_time_utc - now_utc).total_seconds()
             
-            sleep_seconds = (wake_time - now).total_seconds()
+            if sleep_seconds > 0:
+                print(f"😴 Сон на {sleep_seconds/3600:.2f} часов")
+                await asyncio.sleep(sleep_seconds)
+                print("🌞 Проснулись!")
             
-            # Проверка на случай, если вдруг sleep_seconds отрицательный
-            if sleep_seconds < 0:
-                sleep_seconds = 0
-                
-            print(f"😴 Сон на {sleep_seconds/3600:.2f} часов (до 07:30)")
-            print("=" * 50)
-            
-            # Спим до утра
-            await asyncio.sleep(sleep_seconds)
-            
-            print("🌞 Проснулись! Запускаю бота...")
-            print("=" * 50)
-        
-        # Запускаем бота
         print("🤖 Бот работает...")
+        print("=" * 50)
+        
         try:
             await dp.start_polling(bot)
         except Exception as e:
-            print(f"❌ Ошибка при работе: {e}")
+            print(f"❌ Ошибка: {e}")
             print("🔄 Перезапуск через 5 секунд...")
             await asyncio.sleep(5)
 
