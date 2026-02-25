@@ -3,6 +3,8 @@ import asyncio
 import logging
 import sqlite3
 import datetime
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from contextlib import contextmanager
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -14,8 +16,42 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID"))
 # =======================================================
 
-logging.basicConfig(level=logging.INFO)
+# === ФЕЙКОВЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER ===
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(b"Furry Lover Bot is running! 24/7")
+    
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+    
+    def log_message(self, format, *args):
+        # Отключаем логи веб-сервера, чтобы не засорять консоль
+        pass
+
+def run_web_server():
+    try:
+        # Render требует, чтобы приложение слушало порт из переменной PORT
+        port = int(os.environ.get('PORT', 10000))
+        server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+        print(f"🌐 Веб-сервер для Render запущен на порту {port}")
+        server.serve_forever()
+    except Exception as e:
+        print(f"⚠️ Ошибка веб-сервера: {e}")
+
+# Запускаем веб-сервер в отдельном потоке
+# daemon=True значит, что поток закроется сам при выходе из программы
+web_thread = threading.Thread(target=run_web_server, daemon=True)
+web_thread.start()
+print("✅ Веб-сервер запущен в фоновом режиме")
 print("=" * 50)
+
+# =======================================================
+
+logging.basicConfig(level=logging.INFO)
 print("🚀 БОТ ЗАПУСКАЕТСЯ")
 print("=" * 50)
 
@@ -254,20 +290,64 @@ async def handle_all_messages(message: Message):
         logging.error(f"Ошибка: {e}")
         await message.answer("❌ Произошла ошибка. Попробуйте позже.")
 
-# === ЗАПУСК (БЕЗ НОЧНОГО РЕЖИМА) ===
+# === ЗАПУСК С НОЧНЫМ ТАЙМЕРОМ ===
 async def main():
     print(f"✅ Бот запущен! ID группы: {GROUP_ID}")
     print(f"✅ Ссылка на группу: https://t.me/furry_lover_predl")
-    print("🤖 Бот работает круглосуточно...")
-    print("=" * 50)
     
-    try:
-        await dp.start_polling(bot)
-    except Exception as e:
-        print(f"❌ Бот упал с ошибкой: {e}")
-        print("🔄 Перезапуск через 5 секунд...")
-        await asyncio.sleep(5)
-        await main()  # Перезапуск
+    while True:  # Бесконечный цикл для повторения каждый день
+        # Получаем текущее время в UTC и переводим в московское (UTC+3)
+        now_utc = datetime.datetime.now()
+        now_msk = now_utc + datetime.timedelta(hours=3)
+        current_time = now_msk.time()
+        
+        print(f"🕐 Текущее время (МСК): {now_msk.strftime('%H:%M')}")
+        
+        # Ночной режим (00:00 - 07:30 по Москве)
+        night_start = datetime.time(0, 0)    # 00:00 МСК
+        night_end = datetime.time(7, 30)     # 07:30 МСК
+        
+        # Проверяем, ночное ли сейчас время
+        if night_start <= current_time <= night_end:
+            print(f"🌙 Сейчас ночное время по Москве ({current_time.strftime('%H:%M')}). Бот уходит в спячку...")
+            
+            # Вычисляем время пробуждения (сегодня в 07:30 МСК)
+            wake_time_msk = now_msk.replace(hour=7, minute=30, second=0, microsecond=0)
+            
+            # Переводим время пробуждения обратно в UTC для таймера
+            wake_time_utc = wake_time_msk - datetime.timedelta(hours=3)
+            
+            sleep_seconds = (wake_time_utc - now_utc).total_seconds()
+            
+            # Если время пробуждения уже прошло (например, сейчас 7:31), значит спим до завтра
+            if sleep_seconds < 0:
+                wake_time_utc += datetime.timedelta(days=1)
+                sleep_seconds = (wake_time_utc - now_utc).total_seconds()
+                print(f"📅 Текущее время после 07:30, спим до завтрашнего утра")
+                
+            print(f"😴 Сон на {sleep_seconds/3600:.2f} часов (до 07:30 МСК)")
+            print("=" * 50)
+            
+            if sleep_seconds > 0:
+                await asyncio.sleep(sleep_seconds)
+            
+            print("🌞 Проснулись! Запускаю бота...")
+            print("=" * 50)
+        
+        # Запускаем бота и ЖДЁМ, пока он не упадёт
+        print("🤖 Бот работает...")
+        print("=" * 50)
+        try:
+            # Запускаем polling и ждём, пока он не завершится
+            await dp.start_polling(bot)
+        except Exception as e:
+            print(f"❌ Бот упал с ошибкой: {e}")
+            print("🔄 Перезапуск через 5 секунд...")
+            await asyncio.sleep(5)
+        
+        # Небольшая пауза перед проверкой времени и перезапуском
+        print("⏳ Проверка времени перед следующим запуском...")
+        await asyncio.sleep(1)
 
 # === ЗАПУСК ===
 if __name__ == "__main__":
