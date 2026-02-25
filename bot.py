@@ -253,32 +253,49 @@ async def handle_all_messages(message: Message):
                 return
         
         try:
-            topic_id = get_user_topic(user_id)
-            logging.info(f"📌 Тема пользователя: {topic_id}")
-            
-            if not topic_id:
-                logging.info(f"🆕 Создаем тему для {user_id}")
-                topic_name = f"{user.full_name}"
-                if user.username:
-                    topic_name += f" (@{user.username})"
-                topic_name = topic_name[:40]
-                
-                topic = await bot.create_forum_topic(
-                    chat_id=GROUP_ID,
-                    name=topic_name
-                )
-                topic_id = topic.message_thread_id
-                save_user_topic(user_id, topic_id)
-                logging.info(f"✅ Тема создана: {topic_id}")
-                
-                await bot.send_message(
-    chat_id=GROUP_ID,
-    message_thread_id=topic_id,
-    text=f"👤 Новый пользователь: {user.full_name}\n"
-         f"🆔 ID: {user_id}\n"
-         f"📝 Username: @{user.username if user.username else 'нет'}"
-    # parse_mode УБРАЛИ!
-)
+    # Получаем тему из БД
+    topic_id = get_user_topic(user_id)
+    logging.info(f"📌 Тема из БД: {topic_id}")
+    
+    # Проверяем, существует ли ещё тема
+    if topic_id:
+        try:
+            # Пробуем отправить тестовое действие в тему
+            await bot.send_chat_action(
+                chat_id=GROUP_ID,
+                message_thread_id=topic_id,
+                action="typing"
+            )
+        except TelegramBadRequest:
+            # Если темы нет - удаляем из БД и создаём новую
+            logging.warning(f"⚠️ Тема {topic_id} не найдена, создаём новую")
+            save_user_topic(user_id, None)
+            topic_id = None
+    
+    # Если нет темы или она удалена - создаём новую
+    if not topic_id:
+        logging.info(f"🆕 Создаем тему для {user_id}")
+        topic_name = f"{user.full_name}"
+        if user.username:
+            topic_name += f" (@{user.username})"
+        topic_name = topic_name[:40]
+        
+        topic = await bot.create_forum_topic(
+            chat_id=GROUP_ID,
+            name=topic_name
+        )
+        topic_id = topic.message_thread_id
+        save_user_topic(user_id, topic_id)
+        logging.info(f"✅ Тема создана: {topic_id}")
+        
+        # Отправляем приветствие БЕЗ Markdown
+        await bot.send_message(
+            chat_id=GROUP_ID,
+            message_thread_id=topic_id,
+            text=f"👤 Новый пользователь: {user.full_name}\n"
+                 f"🆔 ID: {user_id}\n"
+                 f"📝 Username: @{user.username if user.username else 'нет'}"
+        )
             
             await bot.forward_message(
                 chat_id=GROUP_ID,
