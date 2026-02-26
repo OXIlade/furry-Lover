@@ -4,7 +4,7 @@ import logging
 import sqlite3
 import datetime
 from contextlib import contextmanager
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import Message
 
@@ -91,19 +91,54 @@ def save_user_topic(user_id: int, topic_id: int):
         cursor.execute("INSERT OR REPLACE INTO user_topics (user_id, topic_id) VALUES (?, ?)", (user_id, topic_id))
         conn.commit()
 
+# === АНТИСПАМ ===
+def is_spam(user_id: int, msg_type: str) -> bool:
+    if msg_type == "text":
+        seconds = 5
+    elif msg_type in ["sticker", "animation"]:
+        seconds = 10
+    else:
+        return False
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            DELETE FROM user_messages 
+            WHERE user_id = ? AND message_type = ? 
+            AND message_time < datetime('now', '-{seconds} seconds')
+        """, (user_id, msg_type))
+        
+        cursor.execute(f"""
+            SELECT COUNT(*) FROM user_messages 
+            WHERE user_id = ? AND message_type = ? 
+            AND message_time > datetime('now', '-{seconds} seconds')
+        """, (user_id, msg_type))
+        
+        count = cursor.fetchone()[0]
+        cursor.execute("INSERT INTO user_messages (user_id, message_type) VALUES (?, ?)", 
+                      (user_id, msg_type))
+        conn.commit()
+        return count >= 5
+
 # === КОМАНДА СТАРТ ===
 @dp.message(Command("start"))
 async def start_command(message: Message):
-    await message.answer("Привет! Отправь арт, он попадёт админу.")
+    await message.answer(
+        "Приветствую!\n\n"
+        "Сюда вы можете отправить арт который вы хотите видеть на канале, "
+        "и вскоре он может появится в посте furry lover. (ИИ не желательно)."
+    )
 
 # === КОМАНДЫ АДМИНА ===
 @dp.message(Command("ban"))
 async def ban_command(message: Message):
     if message.chat.id != GROUP_ID:
         return
+    
     if not message.reply_to_message or not message.reply_to_message.forward_from:
         await message.reply("❌ Ответь на сообщение пользователя")
         return
+    
     user_id = message.reply_to_message.forward_from.id
     ban_user(user_id)
     await message.reply(f"✅ Пользователь {user_id} заблокирован")
@@ -112,6 +147,7 @@ async def ban_command(message: Message):
 async def unban_command(message: Message):
     if message.chat.id != GROUP_ID:
         return
+    
     try:
         user_id = int(message.text.split()[1])
         unban_user(user_id)
@@ -122,26 +158,33 @@ async def unban_command(message: Message):
 # === ГЛАВНЫЙ ОБРАБОТЧИК ===
 @dp.message()
 async def handle_all_messages(message: Message):
+    # Сообщения из группы
     if message.chat.id == GROUP_ID:
         if message.reply_to_message and message.reply_to_message.forward_from:
             user_id = message.reply_to_message.forward_from.id
+            
             if is_banned(user_id):
                 await message.reply("❌ Пользователь заблокирован")
                 return
+            
             try:
-                await bot.send_message(user_id, f"📨 ответ от Furry Lover\n\n{message.text}")
+                await bot.send_message(
+                    user_id, 
+                    f"📨 ответ от Furry Lover\n\n{message.text}"
+                )
                 await message.reply("✅ Ответ отправлен пользователю")
             except:
                 await message.reply("❌ Ошибка при отправке")
         return
-
+    
+    # Сообщения от пользователей
     user = message.from_user
     user_id = user.id
-
+    
     if is_banned(user_id):
         await message.answer("❌ Вы заблокированы")
         return
-
+    
     # Тип сообщения
     if message.photo:
         msg_type = "photo"
@@ -153,7 +196,13 @@ async def handle_all_messages(message: Message):
         msg_type = "text"
     else:
         msg_type = "other"
-
+    
+    # Антиспам
+    if msg_type != "photo":
+        if is_spam(user_id, msg_type):
+            await message.answer("⚠️ Слишком много сообщений. Подождите немного.")
+            return
+    
     try:
         topic_id = get_user_topic(user_id)
         
@@ -163,14 +212,18 @@ async def handle_all_messages(message: Message):
                 topic_name += f" (@{user.username})"
             topic_name = topic_name[:40]
             
-            topic = await bot.create_forum_topic(chat_id=GROUP_ID, name=topic_name)
+            topic = await bot.create_forum_topic(
+                chat_id=GROUP_ID,
+                name=topic_name
+            )
             topic_id = topic.message_thread_id
             save_user_topic(user_id, topic_id)
             
             await bot.send_message(
                 chat_id=GROUP_ID,
                 message_thread_id=topic_id,
-                text=f"👤 Новый пользователь: {user.full_name}\n🆔 ID: {user_id}"
+                text=f"👤 Новый пользователь: {user.full_name}\n"
+                     f"🆔 ID: {user_id}"
             )
         
         await bot.forward_message(
@@ -193,10 +246,35 @@ async def handle_all_messages(message: Message):
         logging.error(f"Ошибка: {e}")
         await message.answer("❌ Произошла ошибка. Попробуйте позже.")
 
-# === ЗАПУСК ===
+# === ЗАПУСК С НОЧНЫМ РЕЖИМОМ ===
 async def main():
     print(f"✅ Бот запущен! ID группы: {GROUP_ID}")
-    await dp.start_polling(bot)
+    
+    while True:
+        now_utc = datetime.datetime.now()
+        now_msk = now_utc + datetime.timedelta(hours=3)
+        current_time = now_msk.time()
+        
+        print(f"🕐 Текущее время (МСК): {now_msk.strftime('%H:%M')}")
+        
+        # Ночной режим 00:00–07:30 МСК
+        if datetime.time(0, 0) <= current_time <= datetime.time(7, 30):
+            print("🌙 Ночной режим. Бот уходит в сон до 07:30 МСК...")
+            
+            wake_time_msk = now_msk.replace(hour=7, minute=30, second=0)
+            wake_time_utc = wake_time_msk - datetime.timedelta(hours=3)
+            sleep_seconds = (wake_time_utc - now_utc).total_seconds()
+            
+            if sleep_seconds < 0:
+                wake_time_utc += datetime.timedelta(days=1)
+                sleep_seconds = (wake_time_utc - now_utc).total_seconds()
+            
+            print(f"😴 Сон на {sleep_seconds / 3600:.2f} ч")
+            await asyncio.sleep(sleep_seconds)
+            print("🌞 Проснулись!")
+        
+        print("🤖 Бот работает...")
+        await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
