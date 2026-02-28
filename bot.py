@@ -3,7 +3,8 @@ import asyncio
 import logging
 import sqlite3
 import datetime
-from collections import defaultdict
+import time
+import random
 from contextlib import contextmanager
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -14,9 +15,6 @@ from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID"))
 # ================================
-
-# Глобальный семафор для последовательной обработки
-user_semaphores = defaultdict(lambda: asyncio.Semaphore(1))
 
 logging.basicConfig(level=logging.INFO)
 print("=" * 50)
@@ -58,6 +56,12 @@ def init_db():
                 message_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS processing_queue (
+                user_id INTEGER PRIMARY KEY,
+                locked_until REAL
+            )
+        ''')
         conn.commit()
     print("✅ База данных инициализирована")
 
@@ -94,6 +98,40 @@ def save_user_topic(user_id: int, topic_id: int):
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("INSERT OR REPLACE INTO user_topics (user_id, topic_id) VALUES (?, ?)", (user_id, topic_id))
+        conn.commit()
+
+# === ГЛОБАЛЬНАЯ БЛОКИРОВКА ЧЕРЕЗ БД ===
+async def acquire_processing_lock(user_id: int, timeout=30):
+    """Пытаемся получить право на обработку сообщения пользователя"""
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            now = time.time()
+            
+            # Пробуем вставить или обновить блокировку
+            cursor.execute(
+                "INSERT OR REPLACE INTO processing_queue (user_id, locked_until) VALUES (?, ?)",
+                (user_id, now + 5)  # Блокировка на 5 секунд
+            )
+            conn.commit()
+            
+            # Проверяем, наша ли это блокировка
+            cursor.execute(
+                "SELECT locked_until FROM processing_queue WHERE user_id = ?",
+                (user_id,)
+            )
+            row = cursor.fetchone()
+            if row and abs(row[0] - (now + 5)) < 0.1:  # Наша блокировка
+                return True
+        
+        await asyncio.sleep(0.1 + random.random() * 0.1)
+    return False
+
+def release_processing_lock(user_id: int):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM processing_queue WHERE user_id = ?", (user_id,))
         conn.commit()
 
 # === АНТИСПАМ ===
@@ -186,8 +224,12 @@ async def handle_all_messages(message: Message):
     user = message.from_user
     user_id = user.id
     
-    # === КЛЮЧЕВОЙ МОМЕНТ: СЕМАФОР ===
-    async with user_semaphores[user_id]:
+    # === ЖДЁМ БЛОКИРОВКУ ===
+    if not await acquire_processing_lock(user_id):
+        logging.warning(f"⚠️ Не удалось получить блокировку для {user_id}, пропускаем")
+        return
+    
+    try:
         logging.info(f"📨 Обрабатываю сообщение от {user_id} (@{user.username})")
         
         if is_banned(user_id):
@@ -212,66 +254,67 @@ async def handle_all_messages(message: Message):
                 await message.answer("⚠️ Слишком много сообщений. Подождите немного.")
                 return
         
-        try:
-            topic_id = get_user_topic(user_id)
+        topic_id = get_user_topic(user_id)
+        
+        if topic_id is None:
+            logging.info(f"🆕 Создаём тему для {user_id}")
+            topic_name = f"{user.full_name}"
+            if user.username:
+                topic_name += f" (@{user.username})"
+            topic_name = topic_name[:40]
             
-            if topic_id is None:
-                logging.info(f"🆕 Создаём тему для {user_id}")
-                topic_name = f"{user.full_name}"
-                if user.username:
-                    topic_name += f" (@{user.username})"
-                topic_name = topic_name[:40]
-                
-                topic = await bot.create_forum_topic(
-                    chat_id=GROUP_ID,
-                    name=topic_name
-                )
-                topic_id = topic.message_thread_id
-                save_user_topic(user_id, topic_id)
-                logging.info(f"✅ Тема {topic_id} сохранена для {user_id}")
-                
-                try:
-                    await bot.send_message(
-                        chat_id=GROUP_ID,
-                        message_thread_id=topic_id,
-                        text=f"👤 Новый пользователь: {user.full_name}\n🆔 ID: {user_id}"
-                    )
-                except TelegramRetryAfter as e:
-                    logging.warning(f"⏳ Flood control: ждём {e.retry_after} сек")
-                    await asyncio.sleep(e.retry_after)
-                    await bot.send_message(
-                        chat_id=GROUP_ID,
-                        message_thread_id=topic_id,
-                        text=f"👤 Новый пользователь: {user.full_name}\n🆔 ID: {user_id}"
-                    )
-            else:
-                logging.info(f"📌 Использую существующую тему {topic_id} для {user_id}")
-            
-            # Пересылаем сообщение
-            await bot.forward_message(
+            topic = await bot.create_forum_topic(
                 chat_id=GROUP_ID,
-                from_chat_id=user_id,
-                message_id=message.message_id,
-                message_thread_id=topic_id
+                name=topic_name
             )
+            topic_id = topic.message_thread_id
+            save_user_topic(user_id, topic_id)
+            logging.info(f"✅ Тема {topic_id} сохранена для {user_id}")
             
-            if msg_type == "photo":
-                await message.answer("✅ Арт отправлен администратору на рассмотрение!")
-            elif msg_type == "sticker":
-                await message.answer("✅ Стикер отправлен администратору!")
-            elif msg_type == "animation":
-                await message.answer("✅ GIF отправлен администратору!")
-            else:
-                await message.answer("✅ Сообщение полетело админу^-^")
-                
-        except TelegramRetryAfter as e:
-            logging.warning(f"⏳ Flood control: ждём {e.retry_after} сек")
-            await asyncio.sleep(e.retry_after)
-            # Повторно запускаем обработку этого же сообщения
-            await handle_all_messages(message)
-        except Exception as e:
-            logging.error(f"❌ Ошибка: {e}")
-            await message.answer("❌ Произошла ошибка. Попробуйте позже.")
+            try:
+                await bot.send_message(
+                    chat_id=GROUP_ID,
+                    message_thread_id=topic_id,
+                    text=f"👤 Новый пользователь: {user.full_name}\n🆔 ID: {user_id}"
+                )
+            except TelegramRetryAfter as e:
+                logging.warning(f"⏳ Flood control: ждём {e.retry_after} сек")
+                await asyncio.sleep(e.retry_after)
+                await bot.send_message(
+                    chat_id=GROUP_ID,
+                    message_thread_id=topic_id,
+                    text=f"👤 Новый пользователь: {user.full_name}\n🆔 ID: {user_id}"
+                )
+        else:
+            logging.info(f"📌 Использую существующую тему {topic_id} для {user_id}")
+        
+        # Пересылаем сообщение
+        await bot.forward_message(
+            chat_id=GROUP_ID,
+            from_chat_id=user_id,
+            message_id=message.message_id,
+            message_thread_id=topic_id
+        )
+        
+        if msg_type == "photo":
+            await message.answer("✅ Арт отправлен администратору на рассмотрение!")
+        elif msg_type == "sticker":
+            await message.answer("✅ Стикер отправлен администратору!")
+        elif msg_type == "animation":
+            await message.answer("✅ GIF отправлен администратору!")
+        else:
+            await message.answer("✅ Сообщение полетело админу^-^")
+            
+    except TelegramRetryAfter as e:
+        logging.warning(f"⏳ Flood control: ждём {e.retry_after} сек")
+        await asyncio.sleep(e.retry_after)
+        # Повторно запускаем обработку этого же сообщения
+        await handle_all_messages(message)
+    except Exception as e:
+        logging.error(f"❌ Ошибка: {e}")
+        await message.answer("❌ Произошла ошибка. Попробуйте позже.")
+    finally:
+        release_processing_lock(user_id)
 
 # === ЗАПУСК С НОЧНЫМ РЕЖИМОМ ===
 async def main():
