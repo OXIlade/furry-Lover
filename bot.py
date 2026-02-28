@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import Message
+from aiogram.exceptions import TelegramBadRequest
 
 # ========== НАСТРОЙКИ ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -158,7 +159,7 @@ async def unban_command(message: Message):
 # === ГЛАВНЫЙ ОБРАБОТЧИК ===
 @dp.message()
 async def handle_all_messages(message: Message):
-    # Сообщения из группы
+    # Сообщения из группы (ответы админа)
     if message.chat.id == GROUP_ID:
         if message.reply_to_message and message.reply_to_message.forward_from:
             user_id = message.reply_to_message.forward_from.id
@@ -180,6 +181,8 @@ async def handle_all_messages(message: Message):
     # Сообщения от пользователей
     user = message.from_user
     user_id = user.id
+    
+    logging.info(f"📨 Сообщение от {user_id} (@{user.username})")
     
     if is_banned(user_id):
         await message.answer("❌ Вы заблокированы")
@@ -204,9 +207,12 @@ async def handle_all_messages(message: Message):
             return
     
     try:
+        # === ПОЛУЧАЕМ ТЕМУ ИЗ БД ===
         topic_id = get_user_topic(user_id)
         
-        if not topic_id:
+        if topic_id is None:
+            # Тема не найдена — создаём новую
+            logging.info(f"🆕 Создаём тему для {user_id}")
             topic_name = f"{user.full_name}"
             if user.username:
                 topic_name += f" (@{user.username})"
@@ -217,15 +223,22 @@ async def handle_all_messages(message: Message):
                 name=topic_name
             )
             topic_id = topic.message_thread_id
-            save_user_topic(user_id, topic_id)
             
+            # СОХРАНЯЕМ тему в БД
+            save_user_topic(user_id, topic_id)
+            logging.info(f"✅ Тема {topic_id} сохранена для {user_id}")
+            
+            # Приветствие в новой теме
             await bot.send_message(
                 chat_id=GROUP_ID,
                 message_thread_id=topic_id,
-                text=f"👤 Новый пользователь: {user.full_name}\n"
-                     f"🆔 ID: {user_id}"
+                text=f"👤 Новый пользователь: {user.full_name}\n🆔 ID: {user_id}"
             )
+        else:
+            # Тема уже есть — используем её
+            logging.info(f"📌 Использую существующую тему {topic_id} для {user_id}")
         
+        # Пересылаем сообщение в тему
         await bot.forward_message(
             chat_id=GROUP_ID,
             from_chat_id=user_id,
@@ -233,6 +246,7 @@ async def handle_all_messages(message: Message):
             message_thread_id=topic_id
         )
         
+        # Ответ пользователю
         if msg_type == "photo":
             await message.answer("✅ Арт отправлен администратору на рассмотрение!")
         elif msg_type == "sticker":
@@ -243,7 +257,7 @@ async def handle_all_messages(message: Message):
             await message.answer("✅ Сообщение полетело админу^-^")
             
     except Exception as e:
-        logging.error(f"Ошибка: {e}")
+        logging.error(f"❌ Ошибка: {e}")
         await message.answer("❌ Произошла ошибка. Попробуйте позже.")
 
 # === ЗАПУСК С НОЧНЫМ РЕЖИМОМ ===
