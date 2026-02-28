@@ -217,6 +217,7 @@ async def unban_command(message: Message):
 # === ГЛАВНЫЙ ОБРАБОТЧИК ===
 @dp.message()
 async def handle_all_messages(message: Message):
+    logging.info(f"🆔 UPDATE ID: {message.update_id}")
     if message.chat.id == GROUP_ID:
         if message.reply_to_message and message.reply_to_message.forward_from:
             user_id = message.reply_to_message.forward_from.id
