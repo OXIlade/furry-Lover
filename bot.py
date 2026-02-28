@@ -5,6 +5,7 @@ import sqlite3
 import datetime
 import time
 import threading
+from collections import defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from contextlib import contextmanager
 from aiogram import Bot, Dispatcher, types
@@ -17,7 +18,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID"))
 # ================================
 
-# === ВЕБ-СЕРВЕР ДЛЯ RENDER ===
+# === ВЕБ-СЕРВЕР ===
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -27,15 +28,19 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         pass
 
 threading.Thread(target=lambda: HTTPServer(('0.0.0.0', int(os.environ.get('PORT', 10000)), HealthCheckHandler).serve_forever(), daemon=True).start()
-# ================================
+# ==================
 
 logging.basicConfig(level=logging.INFO)
 print("=" * 50)
 print("🚀 БОТ ЗАПУСКАЕТСЯ")
 print("=" * 50)
 
-# Глобальный семафор — только один апдейт обрабатывается за раз
+# Глобальный семафор — один апдейт за раз
 global_semaphore = asyncio.Semaphore(1)
+
+# Хранилище альбомов
+pending_albums = defaultdict(list)
+album_tasks = set()
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -139,6 +144,30 @@ def is_spam(user_id: int, msg_type: str) -> bool:
         conn.commit()
         return count >= 5
 
+# === ОТПРАВКА АЛЬБОМА ===
+async def send_album(album_messages, topic_id):
+    """Отправляет собранные фото как один альбом"""
+    media_group = []
+    for msg in album_messages:
+        if msg.photo:
+            file_id = msg.photo[-1].file_id
+            media_group.append(types.InputMediaPhoto(media=file_id))
+
+    if media_group:
+        try:
+            await bot.send_media_group(
+                chat_id=GROUP_ID,
+                media=media_group,
+                message_thread_id=topic_id
+            )
+            # Отвечаем только один раз
+            await album_messages[0].answer("✅ Альбом отправлен администратору")
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            await send_album(album_messages, topic_id)
+        except Exception as e:
+            logging.error(f"Ошибка отправки альбома: {e}")
+
 # === КОМАНДА СТАРТ ===
 @dp.message(Command("start"))
 async def start_command(message: Message):
@@ -174,10 +203,10 @@ async def unban_command(message: Message):
     except:
         await message.reply("❌ Использование: /unban USER_ID")
 
-# === ГЛАВНЫЙ ОБРАБОТЧИК (с глобальным семафором) ===
+# === ГЛАВНЫЙ ОБРАБОТЧИК ===
 @dp.message()
 async def handle_all_messages(message: Message):
-    async with global_semaphore:  # <-- КЛЮЧЕВОЙ МОМЕНТ
+    async with global_semaphore:
         # Сообщения из группы (ответы админа)
         if message.chat.id == GROUP_ID:
             if message.reply_to_message and message.reply_to_message.forward_from:
@@ -202,6 +231,15 @@ async def handle_all_messages(message: Message):
             await message.answer("❌ Вы заблокированы")
             return
 
+        # === ОБРАБОТКА АЛЬБОМА ===
+        if message.media_group_id:
+            pending_albums[user_id].append(message)
+            if user_id not in album_tasks:
+                album_tasks.add(user_id)
+                asyncio.create_task(delayed_album_send(user_id))
+            return
+
+        # === ОБЫЧНОЕ СООБЩЕНИЕ ===
         if message.photo:
             msg_type = "photo"
         elif message.sticker:
@@ -218,6 +256,7 @@ async def handle_all_messages(message: Message):
                 await message.answer("⚠️ Слишком много сообщений. Подождите немного.")
                 return
 
+        # Получаем или создаём тему
         topic_id = get_user_topic(user_id)
 
         if topic_id is None:
@@ -248,6 +287,7 @@ async def handle_all_messages(message: Message):
         else:
             logging.info(f"📌 Тема {topic_id} для {user_id}")
 
+        # Пересылаем одиночное сообщение
         await bot.forward_message(GROUP_ID, user_id, message.message_id, message_thread_id=topic_id)
 
         answers = {
@@ -256,6 +296,50 @@ async def handle_all_messages(message: Message):
             "animation": "✅ GIF отправлен администратору!"
         }
         await message.answer(answers.get(msg_type, "✅ Сообщение полетело админу^-^"))
+
+async def delayed_album_send(user_id: int, delay: float = 2.0):
+    """Ждёт, собирает альбом и отправляет"""
+    await asyncio.sleep(delay)
+    async with global_semaphore:
+        messages = pending_albums.pop(user_id, [])
+        album_tasks.discard(user_id)
+        if not messages:
+            return
+
+        # Получаем или создаём тему (по первому сообщению)
+        first_msg = messages[0]
+        user = first_msg.from_user
+        user_id = user.id
+
+        topic_id = get_user_topic(user_id)
+        if topic_id is None:
+            logging.info(f"🆕 Создаём тему для альбома от {user_id}")
+            topic_name = f"{user.full_name}"
+            if user.username:
+                topic_name += f" (@{user.username})"
+            topic_name = topic_name[:40]
+
+            topic = await bot.create_forum_topic(GROUP_ID, topic_name)
+            topic_id = topic.message_thread_id
+            save_user_topic(user_id, topic_id)
+            logging.info(f"✅ Тема {topic_id} сохранена")
+
+            try:
+                await bot.send_message(
+                    GROUP_ID,
+                    message_thread_id=topic_id,
+                    text=f"👤 Новый пользователь: {user.full_name}\n🆔 ID: {user_id}"
+                )
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after)
+                await bot.send_message(
+                    GROUP_ID,
+                    message_thread_id=topic_id,
+                    text=f"👤 Новый пользователь: {user.full_name}\n🆔 ID: {user_id}"
+                )
+
+        # Отправляем альбом
+        await send_album(messages, topic_id)
 
 # === ЗАПУСК ===
 async def main():
