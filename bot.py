@@ -3,6 +3,7 @@ import asyncio
 import logging
 import sqlite3
 import datetime
+from collections import defaultdict
 from contextlib import contextmanager
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -13,6 +14,9 @@ from aiogram.exceptions import TelegramBadRequest
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID"))
 # ================================
+
+# Блокировки для каждого пользователя (чтобы не создавать несколько тем одновременно)
+user_locks = defaultdict(asyncio.Lock)
 
 logging.basicConfig(level=logging.INFO)
 print("=" * 50)
@@ -206,59 +210,61 @@ async def handle_all_messages(message: Message):
             await message.answer("⚠️ Слишком много сообщений. Подождите немного.")
             return
     
-    try:
-        # === ПОЛУЧАЕМ ТЕМУ ИЗ БД ===
-        topic_id = get_user_topic(user_id)
-        
-        if topic_id is None:
-            # Тема не найдена — создаём новую
-            logging.info(f"🆕 Создаём тему для {user_id}")
-            topic_name = f"{user.full_name}"
-            if user.username:
-                topic_name += f" (@{user.username})"
-            topic_name = topic_name[:40]
+    # === БЛОКИРОВКА ===
+    async with user_locks[user_id]:
+        try:
+            # Получаем тему из БД
+            topic_id = get_user_topic(user_id)
             
-            topic = await bot.create_forum_topic(
+            if topic_id is None:
+                # Тема не найдена — создаём новую
+                logging.info(f"🆕 Создаём тему для {user_id}")
+                topic_name = f"{user.full_name}"
+                if user.username:
+                    topic_name += f" (@{user.username})"
+                topic_name = topic_name[:40]
+                
+                topic = await bot.create_forum_topic(
+                    chat_id=GROUP_ID,
+                    name=topic_name
+                )
+                topic_id = topic.message_thread_id
+                
+                # Сохраняем тему в БД
+                save_user_topic(user_id, topic_id)
+                logging.info(f"✅ Тема {topic_id} сохранена для {user_id}")
+                
+                # Приветствие в новой теме
+                await bot.send_message(
+                    chat_id=GROUP_ID,
+                    message_thread_id=topic_id,
+                    text=f"👤 Новый пользователь: {user.full_name}\n🆔 ID: {user_id}"
+                )
+            else:
+                # Тема уже есть — используем её
+                logging.info(f"📌 Использую существующую тему {topic_id} для {user_id}")
+            
+            # Пересылаем сообщение в тему
+            await bot.forward_message(
                 chat_id=GROUP_ID,
-                name=topic_name
+                from_chat_id=user_id,
+                message_id=message.message_id,
+                message_thread_id=topic_id
             )
-            topic_id = topic.message_thread_id
             
-            # СОХРАНЯЕМ тему в БД
-            save_user_topic(user_id, topic_id)
-            logging.info(f"✅ Тема {topic_id} сохранена для {user_id}")
-            
-            # Приветствие в новой теме
-            await bot.send_message(
-                chat_id=GROUP_ID,
-                message_thread_id=topic_id,
-                text=f"👤 Новый пользователь: {user.full_name}\n🆔 ID: {user_id}"
-            )
-        else:
-            # Тема уже есть — используем её
-            logging.info(f"📌 Использую существующую тему {topic_id} для {user_id}")
-        
-        # Пересылаем сообщение в тему
-        await bot.forward_message(
-            chat_id=GROUP_ID,
-            from_chat_id=user_id,
-            message_id=message.message_id,
-            message_thread_id=topic_id
-        )
-        
-        # Ответ пользователю
-        if msg_type == "photo":
-            await message.answer("✅ Арт отправлен администратору на рассмотрение!")
-        elif msg_type == "sticker":
-            await message.answer("✅ Стикер отправлен администратору!")
-        elif msg_type == "animation":
-            await message.answer("✅ GIF отправлен администратору!")
-        else:
-            await message.answer("✅ Сообщение полетело админу^-^")
-            
-    except Exception as e:
-        logging.error(f"❌ Ошибка: {e}")
-        await message.answer("❌ Произошла ошибка. Попробуйте позже.")
+            # Ответ пользователю
+            if msg_type == "photo":
+                await message.answer("✅ Арт отправлен администратору на рассмотрение!")
+            elif msg_type == "sticker":
+                await message.answer("✅ Стикер отправлен администратору!")
+            elif msg_type == "animation":
+                await message.answer("✅ GIF отправлен администратору!")
+            else:
+                await message.answer("✅ Сообщение полетело админу^-^")
+                
+        except Exception as e:
+            logging.error(f"❌ Ошибка: {e}")
+            await message.answer("❌ Произошла ошибка. Попробуйте позже.")
 
 # === ЗАПУСК С НОЧНЫМ РЕЖИМОМ ===
 async def main():
