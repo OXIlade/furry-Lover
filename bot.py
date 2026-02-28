@@ -4,6 +4,7 @@ import logging
 import sqlite3
 import datetime
 import time
+import random
 import threading
 from collections import defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -18,7 +19,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID"))
 # ================================
 
-# === ВЕБ-СЕРВЕР ===
+# === ВЕБ-СЕРВЕР ДЛЯ RENDER (чтобы не останавливали) ===
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -27,8 +28,16 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-threading.Thread(target=lambda: HTTPServer(('0.0.0.0', int(os.environ.get('PORT', 10000)), HealthCheckHandler).serve_forever(), daemon=True).start()
-# ==================
+def run_web_server():
+    try:
+        port = int(os.environ.get('PORT', 10000))
+        server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+        server.serve_forever()
+    except:
+        pass
+
+threading.Thread(target=run_web_server, daemon=True).start()
+# ========================================================
 
 logging.basicConfig(level=logging.INFO)
 print("=" * 50)
@@ -43,7 +52,6 @@ global_lock = asyncio.Lock()
 
 # Хранилище альбомов
 pending_albums = defaultdict(list)
-album_events = defaultdict(asyncio.Event)
 
 # === БАЗА ДАННЫХ ===
 @contextmanager
@@ -75,6 +83,12 @@ def init_db():
                 user_id INTEGER,
                 message_type TEXT,
                 message_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS processing_queue (
+                user_id INTEGER PRIMARY KEY,
+                locked_until REAL
             )
         ''')
         conn.commit()
@@ -144,61 +158,14 @@ def is_spam(user_id: int, msg_type: str) -> bool:
         conn.commit()
         return count >= 5
 
-# === ОТПРАВКА АЛЬБОМА ===
-async def send_album(user_id: int):
-    """Отправляет накопленные фото как один альбом"""
-    async with global_lock:
-        messages = pending_albums.pop(user_id, [])
-        if not messages:
-            return
-
-        first_msg = messages[0]
-        user = first_msg.from_user
-
-        # Получаем или создаём тему
-        topic_id = get_user_topic(user_id)
-        if topic_id is None:
-            logging.info(f"🆕 Создаём тему для альбома от {user_id}")
-            topic_name = f"{user.full_name}"
-            if user.username:
-                topic_name += f" (@{user.username})"
-            topic_name = topic_name[:40]
-
-            topic = await bot.create_forum_topic(GROUP_ID, topic_name)
-            topic_id = topic.message_thread_id
-            save_user_topic(user_id, topic_id)
-            logging.info(f"✅ Тема {topic_id} сохранена")
-
-            await bot.send_message(
-                GROUP_ID,
-                message_thread_id=topic_id,
-                text=f"👤 Новый пользователь: {user.full_name}\n🆔 ID: {user_id}"
-            )
-        else:
-            logging.info(f"📌 Тема {topic_id} для альбома {user_id}")
-
-        # Формируем медиа-группу
-        media_group = []
-        for msg in messages:
-            if msg.photo:
-                file_id = msg.photo[-1].file_id
-                media_group.append(types.InputMediaPhoto(media=file_id))
-
-        if media_group:
-            await bot.send_media_group(
-                chat_id=GROUP_ID,
-                media=media_group,
-                message_thread_id=topic_id
-            )
-            await first_msg.answer("✅ Альбом отправлен администратору")
-
 # === КОМАНДА СТАРТ ===
 @dp.message(Command("start"))
 async def start_command(message: Message):
     await message.answer(
         "Приветствую!\n\n"
-        "Сюда вы можете отправить арт который вы хотите видеть на канале, "
-        "и вскоре он может появится в посте furry lover. (ИИ не желательно)."
+        "Сюда вы можете отправить арт который вы хотите видеть на канале, и вскоре он может появится в посте furry lover.\n\n"
+        "Любые арты содержащие гиперболл, фералы, копро, гуро, расчлененка, дети, строго запрещены (ИИ нежелательно)\n"
+        "Арты кидать по одному (не альбомом), в противном случае блокировка в предложке."
     )
 
 # === КОМАНДЫ АДМИНА ===
@@ -230,7 +197,7 @@ async def unban_command(message: Message):
 # === ГЛАВНЫЙ ОБРАБОТЧИК ===
 @dp.message()
 async def handle_all_messages(message: Message):
-    async with global_lock:  # <-- САМОЕ ВАЖНОЕ
+    async with global_lock:
         # Сообщения из группы (ответы админа)
         if message.chat.id == GROUP_ID:
             if message.reply_to_message and message.reply_to_message.forward_from:
@@ -248,23 +215,13 @@ async def handle_all_messages(message: Message):
         user = message.from_user
         user_id = user.id
 
-        logging.info(f"🆔 UPDATE ID: {message.update_id}")
         logging.info(f"📨 Сообщение от {user_id} (@{user.username})")
 
         if is_banned(user_id):
             await message.answer("❌ Вы заблокированы")
             return
 
-        # === АЛЬБОМ ===
-        if message.media_group_id:
-            pending_albums[user_id].append(message)
-
-            # Если это первое сообщение в альбоме — запускаем таймер
-            if len(pending_albums[user_id]) == 1:
-                asyncio.create_task(album_timeout(user_id))
-            return
-
-        # === ОДИНОЧНОЕ ФОТО ===
+        # Тип сообщения
         if message.photo:
             msg_type = "photo"
         elif message.sticker:
@@ -281,7 +238,6 @@ async def handle_all_messages(message: Message):
                 await message.answer("⚠️ Слишком много сообщений. Подождите немного.")
                 return
 
-        # Получаем или создаём тему
         topic_id = get_user_topic(user_id)
 
         if topic_id is None:
@@ -312,7 +268,6 @@ async def handle_all_messages(message: Message):
         else:
             logging.info(f"📌 Тема {topic_id} для {user_id}")
 
-        # Пересылаем одиночное сообщение
         await bot.forward_message(GROUP_ID, user_id, message.message_id, message_thread_id=topic_id)
 
         answers = {
@@ -321,11 +276,6 @@ async def handle_all_messages(message: Message):
             "animation": "✅ GIF отправлен администратору!"
         }
         await message.answer(answers.get(msg_type, "✅ Сообщение полетело админу^-^"))
-
-async def album_timeout(user_id: int, delay: float = 1.5):
-    """Ждёт, пока соберутся все фото альбома, потом отправляет"""
-    await asyncio.sleep(delay)
-    await send_album(user_id)
 
 # === ЗАПУСК ===
 async def main():
