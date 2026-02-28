@@ -6,6 +6,7 @@ import datetime
 import time
 import random
 import threading
+from collections import defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from contextlib import contextmanager
 from aiogram import Bot, Dispatcher, types
@@ -18,7 +19,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID"))
 # ================================
 
-# === ВЕБ-СЕРВЕР ДЛЯ RENDER (чтобы не останавливали) ===
+# === ВЕБ-СЕРВЕР ДЛЯ RENDER ===
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -27,16 +28,8 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-def run_web_server():
-    try:
-        port = int(os.environ.get('PORT', 10000))
-        server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-        server.serve_forever()
-    except:
-        pass
-
-threading.Thread(target=run_web_server, daemon=True).start()
-# ========================================================
+threading.Thread(target=lambda: HTTPServer(('0.0.0.0', int(os.environ.get('PORT', 10000)), HealthCheckHandler).serve_forever(), daemon=True).start()
+# ================================
 
 logging.basicConfig(level=logging.INFO)
 print("=" * 50)
@@ -78,12 +71,6 @@ def init_db():
                 message_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS processing_queue (
-                user_id INTEGER PRIMARY KEY,
-                locked_until REAL
-            )
-        ''')
         conn.commit()
     print("✅ База данных инициализирована")
 
@@ -120,34 +107,6 @@ def save_user_topic(user_id: int, topic_id: int):
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("INSERT OR REPLACE INTO user_topics (user_id, topic_id) VALUES (?, ?)", (user_id, topic_id))
-        conn.commit()
-
-# === ГЛОБАЛЬНАЯ БЛОКИРОВКА ===
-async def acquire_processing_lock(user_id: int, timeout=30):
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        with get_db() as conn:
-            cursor = conn.cursor()
-            now = time.time()
-            cursor.execute(
-                "INSERT OR REPLACE INTO processing_queue (user_id, locked_until) VALUES (?, ?)",
-                (user_id, now + 5)
-            )
-            conn.commit()
-            cursor.execute(
-                "SELECT locked_until FROM processing_queue WHERE user_id = ?",
-                (user_id,)
-            )
-            row = cursor.fetchone()
-            if row and abs(row[0] - (now + 5)) < 0.1:
-                return True
-        await asyncio.sleep(0.1 + random.random() * 0.1)
-    return False
-
-def release_processing_lock(user_id: int):
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM processing_queue WHERE user_id = ?", (user_id,))
         conn.commit()
 
 # === АНТИСПАМ ===
@@ -214,10 +173,86 @@ async def unban_command(message: Message):
     except:
         await message.reply("❌ Использование: /unban USER_ID")
 
-# === ГЛАВНЫЙ ОБРАБОТЧИК ===
+# === ОЧЕРЕДЬ ПОЛЬЗОВАТЕЛЕЙ ===
+user_queues = defaultdict(asyncio.Queue)
+user_tasks = {}
+
+async def process_user_queue(user_id: int):
+    while True:
+        message = await user_queues[user_id].get()
+        await process_single_message(message)
+        user_queues[user_id].task_done()
+
+async def process_single_message(message: Message):
+    user = message.from_user
+    user_id = user.id
+
+    logging.info(f"🆔 UPDATE ID: {message.update_id}")
+    logging.info(f"📨 Сообщение от {user_id} (@{user.username})")
+
+    if is_banned(user_id):
+        await message.answer("❌ Вы заблокированы")
+        return
+
+    if message.photo:
+        msg_type = "photo"
+    elif message.sticker:
+        msg_type = "sticker"
+    elif message.animation:
+        msg_type = "animation"
+    elif message.text:
+        msg_type = "text"
+    else:
+        msg_type = "other"
+
+    if msg_type != "photo":
+        if is_spam(user_id, msg_type):
+            await message.answer("⚠️ Слишком много сообщений. Подождите немного.")
+            return
+
+    # === КРИТИЧЕСКАЯ СЕКЦИЯ ===
+    topic_id = get_user_topic(user_id)
+    if topic_id is None:
+        logging.info(f"🆕 Создаём тему для {user_id}")
+        topic_name = f"{user.full_name}"
+        if user.username:
+            topic_name += f" (@{user.username})"
+        topic_name = topic_name[:40]
+
+        topic = await bot.create_forum_topic(GROUP_ID, topic_name)
+        topic_id = topic.message_thread_id
+        save_user_topic(user_id, topic_id)
+        logging.info(f"✅ Тема {topic_id} сохранена")
+
+        try:
+            await bot.send_message(
+                GROUP_ID,
+                message_thread_id=topic_id,
+                text=f"👤 Новый пользователь: {user.full_name}\n🆔 ID: {user_id}"
+            )
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            await bot.send_message(
+                GROUP_ID,
+                message_thread_id=topic_id,
+                text=f"👤 Новый пользователь: {user.full_name}\n🆔 ID: {user_id}"
+            )
+    else:
+        logging.info(f"📌 Тема {topic_id} для {user_id}")
+
+    await bot.forward_message(GROUP_ID, user_id, message.message_id, message_thread_id=topic_id)
+
+    answers = {
+        "photo": "✅ Арт отправлен администратору на рассмотрение!",
+        "sticker": "✅ Стикер отправлен администратору!",
+        "animation": "✅ GIF отправлен администратору!"
+    }
+    await message.answer(answers.get(msg_type, "✅ Сообщение полетело админу^-^"))
+
+# === ГЛАВНЫЙ ОБРАБОТЧИК (ставим в очередь) ===
 @dp.message()
 async def handle_all_messages(message: Message):
-    logging.info(f"🆔 UPDATE ID: {message.update_id}")
+    # Ответы админа — сразу, без очереди
     if message.chat.id == GROUP_ID:
         if message.reply_to_message and message.reply_to_message.forward_from:
             user_id = message.reply_to_message.forward_from.id
@@ -231,83 +266,13 @@ async def handle_all_messages(message: Message):
                 await message.reply("❌ Ошибка при отправке")
         return
 
-    user = message.from_user
-    user_id = user.id
+    user_id = message.from_user.id
 
-    if not await acquire_processing_lock(user_id):
-        logging.warning(f"⚠️ Пропускаем {user_id}")
-        return
+    # Создаём воркер для пользователя, если ещё нет
+    if user_id not in user_tasks:
+        user_tasks[user_id] = asyncio.create_task(process_user_queue(user_id))
 
-    try:
-        logging.info(f"📨 Сообщение от {user_id} (@{user.username})")
-
-        if is_banned(user_id):
-            await message.answer("❌ Вы заблокированы")
-            return
-
-        if message.photo:
-            msg_type = "photo"
-        elif message.sticker:
-            msg_type = "sticker"
-        elif message.animation:
-            msg_type = "animation"
-        elif message.text:
-            msg_type = "text"
-        else:
-            msg_type = "other"
-
-        if msg_type != "photo":
-            if is_spam(user_id, msg_type):
-                await message.answer("⚠️ Слишком много сообщений. Подождите немного.")
-                return
-
-        topic_id = get_user_topic(user_id)
-
-        if topic_id is None:
-            logging.info(f"🆕 Создаём тему для {user_id}")
-            topic_name = f"{user.full_name}"
-            if user.username:
-                topic_name += f" (@{user.username})"
-            topic_name = topic_name[:40]
-
-            topic = await bot.create_forum_topic(GROUP_ID, topic_name)
-            topic_id = topic.message_thread_id
-            save_user_topic(user_id, topic_id)
-            logging.info(f"✅ Тема {topic_id} сохранена")
-
-            try:
-                await bot.send_message(
-                    GROUP_ID,
-                    message_thread_id=topic_id,
-                    text=f"👤 Новый пользователь: {user.full_name}\n🆔 ID: {user_id}"
-                )
-            except TelegramRetryAfter as e:
-                await asyncio.sleep(e.retry_after)
-                await bot.send_message(
-                    GROUP_ID,
-                    message_thread_id=topic_id,
-                    text=f"👤 Новый пользователь: {user.full_name}\n🆔 ID: {user_id}"
-                )
-        else:
-            logging.info(f"📌 Тема {topic_id} для {user_id}")
-
-        await bot.forward_message(GROUP_ID, user_id, message.message_id, message_thread_id=topic_id)
-
-        answers = {
-            "photo": "✅ Арт отправлен администратору на рассмотрение!",
-            "sticker": "✅ Стикер отправлен администратору!",
-            "animation": "✅ GIF отправлен администратору!"
-        }
-        await message.answer(answers.get(msg_type, "✅ Сообщение полетело админу^-^"))
-
-    except TelegramRetryAfter as e:
-        await asyncio.sleep(e.retry_after)
-        await handle_all_messages(message)
-    except Exception as e:
-        logging.error(f"❌ Ошибка: {e}")
-        await message.answer("❌ Произошла ошибка. Попробуйте позже.")
-    finally:
-        release_processing_lock(user_id)
+    await user_queues[user_id].put(message)
 
 # === ЗАПУСК ===
 async def main():
