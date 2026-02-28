@@ -35,15 +35,15 @@ print("=" * 50)
 print("🚀 БОТ ЗАПУСКАЕТСЯ")
 print("=" * 50)
 
-# Глобальный семафор — один апдейт за раз
-global_semaphore = asyncio.Semaphore(1)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# Глобальная блокировка — один апдейт за раз
+global_lock = asyncio.Lock()
 
 # Хранилище альбомов
 pending_albums = defaultdict(list)
-album_tasks = set()
-
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+album_events = defaultdict(asyncio.Event)
 
 # === БАЗА ДАННЫХ ===
 @contextmanager
@@ -145,28 +145,52 @@ def is_spam(user_id: int, msg_type: str) -> bool:
         return count >= 5
 
 # === ОТПРАВКА АЛЬБОМА ===
-async def send_album(album_messages, topic_id):
-    """Отправляет собранные фото как один альбом"""
-    media_group = []
-    for msg in album_messages:
-        if msg.photo:
-            file_id = msg.photo[-1].file_id
-            media_group.append(types.InputMediaPhoto(media=file_id))
+async def send_album(user_id: int):
+    """Отправляет накопленные фото как один альбом"""
+    async with global_lock:
+        messages = pending_albums.pop(user_id, [])
+        if not messages:
+            return
 
-    if media_group:
-        try:
+        first_msg = messages[0]
+        user = first_msg.from_user
+
+        # Получаем или создаём тему
+        topic_id = get_user_topic(user_id)
+        if topic_id is None:
+            logging.info(f"🆕 Создаём тему для альбома от {user_id}")
+            topic_name = f"{user.full_name}"
+            if user.username:
+                topic_name += f" (@{user.username})"
+            topic_name = topic_name[:40]
+
+            topic = await bot.create_forum_topic(GROUP_ID, topic_name)
+            topic_id = topic.message_thread_id
+            save_user_topic(user_id, topic_id)
+            logging.info(f"✅ Тема {topic_id} сохранена")
+
+            await bot.send_message(
+                GROUP_ID,
+                message_thread_id=topic_id,
+                text=f"👤 Новый пользователь: {user.full_name}\n🆔 ID: {user_id}"
+            )
+        else:
+            logging.info(f"📌 Тема {topic_id} для альбома {user_id}")
+
+        # Формируем медиа-группу
+        media_group = []
+        for msg in messages:
+            if msg.photo:
+                file_id = msg.photo[-1].file_id
+                media_group.append(types.InputMediaPhoto(media=file_id))
+
+        if media_group:
             await bot.send_media_group(
                 chat_id=GROUP_ID,
                 media=media_group,
                 message_thread_id=topic_id
             )
-            # Отвечаем только один раз
-            await album_messages[0].answer("✅ Альбом отправлен администратору")
-        except TelegramRetryAfter as e:
-            await asyncio.sleep(e.retry_after)
-            await send_album(album_messages, topic_id)
-        except Exception as e:
-            logging.error(f"Ошибка отправки альбома: {e}")
+            await first_msg.answer("✅ Альбом отправлен администратору")
 
 # === КОМАНДА СТАРТ ===
 @dp.message(Command("start"))
@@ -206,7 +230,7 @@ async def unban_command(message: Message):
 # === ГЛАВНЫЙ ОБРАБОТЧИК ===
 @dp.message()
 async def handle_all_messages(message: Message):
-    async with global_semaphore:
+    async with global_lock:  # <-- САМОЕ ВАЖНОЕ
         # Сообщения из группы (ответы админа)
         if message.chat.id == GROUP_ID:
             if message.reply_to_message and message.reply_to_message.forward_from:
@@ -231,15 +255,16 @@ async def handle_all_messages(message: Message):
             await message.answer("❌ Вы заблокированы")
             return
 
-        # === ОБРАБОТКА АЛЬБОМА ===
+        # === АЛЬБОМ ===
         if message.media_group_id:
             pending_albums[user_id].append(message)
-            if user_id not in album_tasks:
-                album_tasks.add(user_id)
-                asyncio.create_task(delayed_album_send(user_id))
+
+            # Если это первое сообщение в альбоме — запускаем таймер
+            if len(pending_albums[user_id]) == 1:
+                asyncio.create_task(album_timeout(user_id))
             return
 
-        # === ОБЫЧНОЕ СООБЩЕНИЕ ===
+        # === ОДИНОЧНОЕ ФОТО ===
         if message.photo:
             msg_type = "photo"
         elif message.sticker:
@@ -297,49 +322,10 @@ async def handle_all_messages(message: Message):
         }
         await message.answer(answers.get(msg_type, "✅ Сообщение полетело админу^-^"))
 
-async def delayed_album_send(user_id: int, delay: float = 2.0):
-    """Ждёт, собирает альбом и отправляет"""
+async def album_timeout(user_id: int, delay: float = 1.5):
+    """Ждёт, пока соберутся все фото альбома, потом отправляет"""
     await asyncio.sleep(delay)
-    async with global_semaphore:
-        messages = pending_albums.pop(user_id, [])
-        album_tasks.discard(user_id)
-        if not messages:
-            return
-
-        # Получаем или создаём тему (по первому сообщению)
-        first_msg = messages[0]
-        user = first_msg.from_user
-        user_id = user.id
-
-        topic_id = get_user_topic(user_id)
-        if topic_id is None:
-            logging.info(f"🆕 Создаём тему для альбома от {user_id}")
-            topic_name = f"{user.full_name}"
-            if user.username:
-                topic_name += f" (@{user.username})"
-            topic_name = topic_name[:40]
-
-            topic = await bot.create_forum_topic(GROUP_ID, topic_name)
-            topic_id = topic.message_thread_id
-            save_user_topic(user_id, topic_id)
-            logging.info(f"✅ Тема {topic_id} сохранена")
-
-            try:
-                await bot.send_message(
-                    GROUP_ID,
-                    message_thread_id=topic_id,
-                    text=f"👤 Новый пользователь: {user.full_name}\n🆔 ID: {user_id}"
-                )
-            except TelegramRetryAfter as e:
-                await asyncio.sleep(e.retry_after)
-                await bot.send_message(
-                    GROUP_ID,
-                    message_thread_id=topic_id,
-                    text=f"👤 Новый пользователь: {user.full_name}\n🆔 ID: {user_id}"
-                )
-
-        # Отправляем альбом
-        await send_album(messages, topic_id)
+    await send_album(user_id)
 
 # === ЗАПУСК ===
 async def main():
