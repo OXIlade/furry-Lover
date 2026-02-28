@@ -5,6 +5,8 @@ import sqlite3
 import datetime
 import time
 import random
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from contextlib import contextmanager
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -15,6 +17,26 @@ from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID"))
 # ================================
+
+# === ВЕБ-СЕРВЕР ДЛЯ RENDER (чтобы не останавливали) ===
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, *args):
+        pass
+
+def run_web_server():
+    try:
+        port = int(os.environ.get('PORT', 10000))
+        server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+        server.serve_forever()
+    except:
+        pass
+
+threading.Thread(target=run_web_server, daemon=True).start()
+# ========================================================
 
 logging.basicConfig(level=logging.INFO)
 print("=" * 50)
@@ -100,31 +122,25 @@ def save_user_topic(user_id: int, topic_id: int):
         cursor.execute("INSERT OR REPLACE INTO user_topics (user_id, topic_id) VALUES (?, ?)", (user_id, topic_id))
         conn.commit()
 
-# === ГЛОБАЛЬНАЯ БЛОКИРОВКА ЧЕРЕЗ БД ===
+# === ГЛОБАЛЬНАЯ БЛОКИРОВКА ===
 async def acquire_processing_lock(user_id: int, timeout=30):
-    """Пытаемся получить право на обработку сообщения пользователя"""
     start_time = time.time()
     while time.time() - start_time < timeout:
         with get_db() as conn:
             cursor = conn.cursor()
             now = time.time()
-            
-            # Пробуем вставить или обновить блокировку
             cursor.execute(
                 "INSERT OR REPLACE INTO processing_queue (user_id, locked_until) VALUES (?, ?)",
-                (user_id, now + 5)  # Блокировка на 5 секунд
+                (user_id, now + 5)
             )
             conn.commit()
-            
-            # Проверяем, наша ли это блокировка
             cursor.execute(
                 "SELECT locked_until FROM processing_queue WHERE user_id = ?",
                 (user_id,)
             )
             row = cursor.fetchone()
-            if row and abs(row[0] - (now + 5)) < 0.1:  # Наша блокировка
+            if row and abs(row[0] - (now + 5)) < 0.1:
                 return True
-        
         await asyncio.sleep(0.1 + random.random() * 0.1)
     return False
 
@@ -201,42 +217,33 @@ async def unban_command(message: Message):
 # === ГЛАВНЫЙ ОБРАБОТЧИК ===
 @dp.message()
 async def handle_all_messages(message: Message):
-    # Сообщения из группы (ответы админа)
     if message.chat.id == GROUP_ID:
         if message.reply_to_message and message.reply_to_message.forward_from:
             user_id = message.reply_to_message.forward_from.id
-            
             if is_banned(user_id):
                 await message.reply("❌ Пользователь заблокирован")
                 return
-            
             try:
-                await bot.send_message(
-                    user_id, 
-                    f"📨 ответ от Furry Lover\n\n{message.text}"
-                )
+                await bot.send_message(user_id, f"📨 ответ от Furry Lover\n\n{message.text}")
                 await message.reply("✅ Ответ отправлен пользователю")
             except:
                 await message.reply("❌ Ошибка при отправке")
         return
-    
-    # Сообщения от пользователей
+
     user = message.from_user
     user_id = user.id
-    
-    # === ЖДЁМ БЛОКИРОВКУ ===
+
     if not await acquire_processing_lock(user_id):
-        logging.warning(f"⚠️ Не удалось получить блокировку для {user_id}, пропускаем")
+        logging.warning(f"⚠️ Пропускаем {user_id}")
         return
-    
+
     try:
-        logging.info(f"📨 Обрабатываю сообщение от {user_id} (@{user.username})")
-        
+        logging.info(f"📨 Сообщение от {user_id} (@{user.username})")
+
         if is_banned(user_id):
             await message.answer("❌ Вы заблокированы")
             return
-        
-        # Тип сообщения
+
         if message.photo:
             msg_type = "photo"
         elif message.sticker:
@@ -247,68 +254,53 @@ async def handle_all_messages(message: Message):
             msg_type = "text"
         else:
             msg_type = "other"
-        
-        # Антиспам
+
         if msg_type != "photo":
             if is_spam(user_id, msg_type):
                 await message.answer("⚠️ Слишком много сообщений. Подождите немного.")
                 return
-        
+
         topic_id = get_user_topic(user_id)
-        
+
         if topic_id is None:
             logging.info(f"🆕 Создаём тему для {user_id}")
             topic_name = f"{user.full_name}"
             if user.username:
                 topic_name += f" (@{user.username})"
             topic_name = topic_name[:40]
-            
-            topic = await bot.create_forum_topic(
-                chat_id=GROUP_ID,
-                name=topic_name
-            )
+
+            topic = await bot.create_forum_topic(GROUP_ID, topic_name)
             topic_id = topic.message_thread_id
             save_user_topic(user_id, topic_id)
-            logging.info(f"✅ Тема {topic_id} сохранена для {user_id}")
-            
+            logging.info(f"✅ Тема {topic_id} сохранена")
+
             try:
                 await bot.send_message(
-                    chat_id=GROUP_ID,
+                    GROUP_ID,
                     message_thread_id=topic_id,
                     text=f"👤 Новый пользователь: {user.full_name}\n🆔 ID: {user_id}"
                 )
             except TelegramRetryAfter as e:
-                logging.warning(f"⏳ Flood control: ждём {e.retry_after} сек")
                 await asyncio.sleep(e.retry_after)
                 await bot.send_message(
-                    chat_id=GROUP_ID,
+                    GROUP_ID,
                     message_thread_id=topic_id,
                     text=f"👤 Новый пользователь: {user.full_name}\n🆔 ID: {user_id}"
                 )
         else:
-            logging.info(f"📌 Использую существующую тему {topic_id} для {user_id}")
-        
-        # Пересылаем сообщение
-        await bot.forward_message(
-            chat_id=GROUP_ID,
-            from_chat_id=user_id,
-            message_id=message.message_id,
-            message_thread_id=topic_id
-        )
-        
-        if msg_type == "photo":
-            await message.answer("✅ Арт отправлен администратору на рассмотрение!")
-        elif msg_type == "sticker":
-            await message.answer("✅ Стикер отправлен администратору!")
-        elif msg_type == "animation":
-            await message.answer("✅ GIF отправлен администратору!")
-        else:
-            await message.answer("✅ Сообщение полетело админу^-^")
-            
+            logging.info(f"📌 Тема {topic_id} для {user_id}")
+
+        await bot.forward_message(GROUP_ID, user_id, message.message_id, message_thread_id=topic_id)
+
+        answers = {
+            "photo": "✅ Арт отправлен администратору на рассмотрение!",
+            "sticker": "✅ Стикер отправлен администратору!",
+            "animation": "✅ GIF отправлен администратору!"
+        }
+        await message.answer(answers.get(msg_type, "✅ Сообщение полетело админу^-^"))
+
     except TelegramRetryAfter as e:
-        logging.warning(f"⏳ Flood control: ждём {e.retry_after} сек")
         await asyncio.sleep(e.retry_after)
-        # Повторно запускаем обработку этого же сообщения
         await handle_all_messages(message)
     except Exception as e:
         logging.error(f"❌ Ошибка: {e}")
@@ -316,33 +308,17 @@ async def handle_all_messages(message: Message):
     finally:
         release_processing_lock(user_id)
 
-# === ЗАПУСК С НОЧНЫМ РЕЖИМОМ ===
+# === ЗАПУСК ===
 async def main():
     print(f"✅ Бот запущен! ID группы: {GROUP_ID}")
-    
     while True:
-        now_utc = datetime.datetime.now()
-        now_msk = now_utc + datetime.timedelta(hours=3)
-        current_time = now_msk.time()
-        
-        print(f"🕐 Текущее время (МСК): {now_msk.strftime('%H:%M')}")
-        
-        if datetime.time(0, 0) <= current_time <= datetime.time(7, 30):
-            print("🌙 Ночной режим. Бот уходит в сон до 07:30 МСК...")
-            
-            wake_time_msk = now_msk.replace(hour=7, minute=30, second=0)
-            wake_time_utc = wake_time_msk - datetime.timedelta(hours=3)
-            sleep_seconds = (wake_time_utc - now_utc).total_seconds()
-            
-            if sleep_seconds < 0:
-                wake_time_utc += datetime.timedelta(days=1)
-                sleep_seconds = (wake_time_utc - now_utc).total_seconds()
-            
-            print(f"😴 Сон на {sleep_seconds / 3600:.2f} ч")
-            await asyncio.sleep(sleep_seconds)
-            print("🌞 Проснулись!")
-        
-        print("🤖 Бот работает...")
+        now = datetime.datetime.now() + datetime.timedelta(hours=3)
+        if datetime.time(0, 0) <= now.time() <= datetime.time(7, 30):
+            wake = (now.replace(hour=7, minute=30, second=0) - datetime.timedelta(hours=3)).timestamp()
+            sleep_sec = max(0, wake - time.time())
+            if sleep_sec > 0:
+                print(f"🌙 Сон до 07:30 МСК")
+                await asyncio.sleep(sleep_sec)
         await dp.start_polling(bot)
 
 if __name__ == "__main__":
