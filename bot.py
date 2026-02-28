@@ -8,15 +8,17 @@ from contextlib import contextmanager
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import Message
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 
 # ========== НАСТРОЙКИ ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID"))
 # ================================
 
-# Блокировки для каждого пользователя (чтобы не создавать несколько тем одновременно)
+# Блокировки для пользователей и альбомов
 user_locks = defaultdict(asyncio.Lock)
+album_locks = defaultdict(asyncio.Lock)
+album_processed = set()  # чтобы не создавать тему повторно для одного альбома
 
 logging.basicConfig(level=logging.INFO)
 print("=" * 50)
@@ -210,14 +212,33 @@ async def handle_all_messages(message: Message):
             await message.answer("⚠️ Слишком много сообщений. Подождите немного.")
             return
     
-    # === БЛОКИРОВКА ===
+    # === ОБРАБОТКА АЛЬБОМОВ ===
+    if message.media_group_id:
+        album_id = message.media_group_id
+        async with album_locks[album_id]:
+            if album_id in album_processed:
+                # Тема для этого альбома уже создана, просто ждём и пересылаем
+                await asyncio.sleep(0.5)  # даём время первому сообщению создать тему
+                topic_id = get_user_topic(user_id)
+                if topic_id:
+                    await bot.forward_message(
+                        chat_id=GROUP_ID,
+                        from_chat_id=user_id,
+                        message_id=message.message_id,
+                        message_thread_id=topic_id
+                    )
+                    await message.answer("✅ Арт из альбома добавлен")
+                return
+            else:
+                album_processed.add(album_id)
+                # Продолжаем создание темы для первого сообщения альбома
+    
+    # === БЛОКИРОВКА ПОЛЬЗОВАТЕЛЯ ===
     async with user_locks[user_id]:
         try:
-            # Получаем тему из БД
             topic_id = get_user_topic(user_id)
             
             if topic_id is None:
-                # Тема не найдена — создаём новую
                 logging.info(f"🆕 Создаём тему для {user_id}")
                 topic_name = f"{user.full_name}"
                 if user.username:
@@ -229,22 +250,27 @@ async def handle_all_messages(message: Message):
                     name=topic_name
                 )
                 topic_id = topic.message_thread_id
-                
-                # Сохраняем тему в БД
                 save_user_topic(user_id, topic_id)
                 logging.info(f"✅ Тема {topic_id} сохранена для {user_id}")
                 
-                # Приветствие в новой теме
-                await bot.send_message(
-                    chat_id=GROUP_ID,
-                    message_thread_id=topic_id,
-                    text=f"👤 Новый пользователь: {user.full_name}\n🆔 ID: {user_id}"
-                )
+                try:
+                    await bot.send_message(
+                        chat_id=GROUP_ID,
+                        message_thread_id=topic_id,
+                        text=f"👤 Новый пользователь: {user.full_name}\n🆔 ID: {user_id}"
+                    )
+                except TelegramRetryAfter as e:
+                    logging.warning(f"⏳ Flood control: ждём {e.retry_after} сек")
+                    await asyncio.sleep(e.retry_after)
+                    await bot.send_message(
+                        chat_id=GROUP_ID,
+                        message_thread_id=topic_id,
+                        text=f"👤 Новый пользователь: {user.full_name}\n🆔 ID: {user_id}"
+                    )
             else:
-                # Тема уже есть — используем её
-                logging.info(f"📌 Использую существующую тему {topic_id} для {user_id}")
+                logging.info(f"📌 Использую тему {topic_id} для {user_id}")
             
-            # Пересылаем сообщение в тему
+            # Пересылаем сообщение
             await bot.forward_message(
                 chat_id=GROUP_ID,
                 from_chat_id=user_id,
@@ -262,6 +288,10 @@ async def handle_all_messages(message: Message):
             else:
                 await message.answer("✅ Сообщение полетело админу^-^")
                 
+        except TelegramRetryAfter as e:
+            logging.warning(f"⏳ Flood control: ждём {e.retry_after} сек")
+            await asyncio.sleep(e.retry_after)
+            await handle_all_messages(message)
         except Exception as e:
             logging.error(f"❌ Ошибка: {e}")
             await message.answer("❌ Произошла ошибка. Попробуйте позже.")
@@ -277,7 +307,6 @@ async def main():
         
         print(f"🕐 Текущее время (МСК): {now_msk.strftime('%H:%M')}")
         
-        # Ночной режим 00:00–07:30 МСК
         if datetime.time(0, 0) <= current_time <= datetime.time(7, 30):
             print("🌙 Ночной режим. Бот уходит в сон до 07:30 МСК...")
             
