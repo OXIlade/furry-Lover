@@ -19,7 +19,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID"))
 # ================================
 
-# === ВЕБ-СЕРВЕР ДЛЯ RENDER (чтобы не останавливали) ===
+# === ВЕБ-СЕРВЕР ДЛЯ RENDER ===
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -37,7 +37,7 @@ def run_web_server():
         pass
 
 threading.Thread(target=run_web_server, daemon=True).start()
-# ========================================================
+# ================================
 
 logging.basicConfig(level=logging.INFO)
 print("=" * 50)
@@ -277,18 +277,44 @@ async def handle_all_messages(message: Message):
         }
         await message.answer(answers.get(msg_type, "✅ Сообщение полетело админу^-^"))
 
-# === ЗАПУСК ===
+# === ЗАПУСК С НОЧНЫМ РЕЖИМОМ ===
 async def main():
     print(f"✅ Бот запущен! ID группы: {GROUP_ID}")
+    
     while True:
-        now = datetime.datetime.now() + datetime.timedelta(hours=3)
-        if datetime.time(0, 0) <= now.time() <= datetime.time(7, 30):
-            wake = (now.replace(hour=7, minute=30, second=0) - datetime.timedelta(hours=3)).timestamp()
-            sleep_sec = max(0, wake - time.time())
-            if sleep_sec > 0:
-                print(f"🌙 Сон до 07:30 МСК")
-                await asyncio.sleep(sleep_sec)
-        await dp.start_polling(bot)
+        # Проверяем время (МСК)
+        now_utc = datetime.datetime.now()
+        now_msk = now_utc + datetime.timedelta(hours=3)
+        current_time = now_msk.time()
+        
+        print(f"🕐 Текущее время (МСК): {now_msk.strftime('%H:%M')}")
+        
+        # Ночной режим 00:00–07:30 МСК
+        if datetime.time(0, 0) <= current_time <= datetime.time(7, 30):
+            print("🌙 Ночной режим. Бот уходит в сон до 07:30 МСК...")
+            
+            # Рассчитываем время пробуждения
+            wake_time_msk = now_msk.replace(hour=7, minute=30, second=0, microsecond=0)
+            wake_time_utc = wake_time_msk - datetime.timedelta(hours=3)
+            sleep_seconds = (wake_time_utc - now_utc).total_seconds()
+            
+            if sleep_seconds < 0:
+                wake_time_utc += datetime.timedelta(days=1)
+                sleep_seconds = (wake_time_utc - now_utc).total_seconds()
+            
+            print(f"😴 Сон на {sleep_seconds / 3600:.2f} часов")
+            await asyncio.sleep(sleep_seconds)
+            print("🌞 Проснулись!")
+            continue  # Возвращаемся к началу цикла
+        
+        print("🤖 Бот работает...")
+        try:
+            # Запускаем polling с обработкой ошибок
+            await dp.start_polling(bot)
+        except Exception as e:
+            logging.error(f"❌ Ошибка polling: {e}")
+            print("🔄 Перезапуск через 5 секунд...")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
     asyncio.run(main())
